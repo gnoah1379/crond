@@ -16,8 +16,9 @@ const (
 	Scheduled TaskState = "SCHEDULED"
 	Running   TaskState = "RUNNING"
 	Retry     TaskState = "RETRY"
-	Success   TaskState = "SUCCESS"
+	Succeeded TaskState = "SUCCEEDED"
 	Failed    TaskState = "FAILED"
+	Cancelled TaskState = "CANCELLED"
 )
 
 type Job struct {
@@ -35,117 +36,112 @@ type Job struct {
 	CronJobID    *ulid.ULID `json:"cronJobId"`
 }
 
-type jobQueueItem struct {
-	*Job
-	index int
+type jobHeap struct {
+	jobs     []*Job
+	indexMap map[ulid.ULID]int
 }
 
-type jobQueue []*jobQueueItem
-
-func (jq jobQueue) Len() int {
-	return len(jq)
+func (h *jobHeap) Len() int {
+	return len(h.jobs)
 }
 
-func (jq jobQueue) Less(i, j int) bool {
-	return jq[i].ScheduleTime.Before(jq[j].ScheduleTime)
+func (h *jobHeap) Less(i, j int) bool {
+	return h.jobs[i].ScheduleTime.Before(h.jobs[j].ScheduleTime)
 }
 
-func (jq jobQueue) Swap(i, j int) {
-	jq[i], jq[j] = jq[j], jq[i]
+func (h *jobHeap) Swap(i, j int) {
+	h.jobs[i], h.jobs[j] = h.jobs[j], h.jobs[i]
+	h.indexMap[h.jobs[i].ID] = i
+	h.indexMap[h.jobs[j].ID] = j
 }
 
-func (jq *jobQueue) Push(x any) {
-	*jq = append(*jq, x.(*jobQueueItem))
+func (h *jobHeap) Push(x interface{}) {
+	t := x.(*Job)
+	h.jobs = append(h.jobs, t)
+	h.indexMap[t.ID] = len(h.jobs) - 1
 }
 
-func (jq *jobQueue) Pop() any {
-	old := *jq
-	n := len(old)
-	x := old[n-1]
-	*jq = old[0 : n-1]
-	return x
+func (h *jobHeap) Pop() interface{} {
+	n := len(h.jobs)
+	t := h.jobs[n-1]
+	h.jobs = h.jobs[:n-1]
+	delete(h.indexMap, t.ID)
+	return t
 }
 
-func (jq *jobQueue) Peek() *Job {
-	if jq.Len() == 0 {
+func (h *jobHeap) Peek() *Job {
+	if len(h.jobs) == 0 {
 		return nil
 	}
-	return (*jq)[0].Job
-}
-
-func (jq *jobQueue) update(index int, job *Job) {
-	(*jq)[index].Job = job
-	heap.Fix(jq, index)
+	return h.jobs[0]
 }
 
 type JobScheduler struct {
-	heap     jobQueue
-	indexMap map[ulid.ULID]int
-	timer    *time.Timer
-	jobChan  chan *Job
-	mu       sync.Mutex
+	heap  *jobHeap
+	timer *time.Timer
+	repo  Repository
+	mu    sync.Mutex
 }
 
 func NewJobScheduler() *JobScheduler {
 	return &JobScheduler{
-		heap:     make(jobQueue, 0),
-		indexMap: make(map[ulid.ULID]int),
-		jobChan:  make(chan *Job),
-		timer:    time.NewTimer(math.MaxInt64),
+		heap:  &jobHeap{indexMap: make(map[ulid.ULID]int)},
+		timer: time.NewTimer(math.MaxInt64),
 	}
 }
 
-func (js *JobScheduler) ScheduleJob(job *Job) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	index, ok := js.indexMap[job.ID]
+func (s *JobScheduler) Schedule(job *Job) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index, ok := s.heap.indexMap[job.ID]
 	if ok {
-		js.heap.update(index, job)
+		s.heap.jobs[index] = job
+		heap.Fix(s.heap, index)
 	} else {
-		item := &jobQueueItem{Job: job}
-		heap.Push(&js.heap, item)
-		js.indexMap[job.ID] = item.index
+		heap.Push(s.heap, job)
 	}
-
-	index = js.indexMap[job.ID]
+	index = s.heap.indexMap[job.ID]
 	if index == 0 {
-		js.timer.Reset(job.ScheduleTime.Sub(time.Now()))
+		s.timer.Reset(job.ScheduleTime.Sub(time.Now()))
 	}
 }
 
-func (js *JobScheduler) RemoveJob(id ulid.ULID) {
-	js.mu.Lock()
-	defer js.mu.Unlock()
-	index, ok := js.indexMap[id]
+func (s *JobScheduler) Remove(id ulid.ULID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	index, ok := s.heap.indexMap[id]
 	if !ok {
 		return
 	}
-	heap.Remove(&js.heap, index)
-	delete(js.indexMap, id)
+	heap.Remove(s.heap, index)
 }
 
-func (js *JobScheduler) Run(ctx context.Context) {
-	defer js.timer.Stop()
+func (s *JobScheduler) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-js.timer.C:
-			js.mu.Lock()
-			job := heap.Pop(&js.heap).(*jobQueueItem).Job
-			delete(js.indexMap, job.ID)
-			nextJob := js.heap.Peek()
-			if nextJob != nil {
-				js.timer.Reset(nextJob.ScheduleTime.Sub(time.Now()))
-			} else {
-				js.timer.Reset(math.MaxInt64)
-			}
-			js.mu.Unlock()
-			js.jobChan <- job
+		case <-s.timer.C:
+			s.mu.Lock()
+			job := heap.Pop(s.heap).(*Job)
+			s.resetTimer()
+			s.mu.Unlock()
+			_ = job
+			// TODO save and send job to worker
 		}
 	}
 }
 
-func (js *JobScheduler) NextJob() <-chan *Job {
-	return js.jobChan
+func (s *JobScheduler) resetTimer() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job := s.heap.Peek()
+	if job == nil {
+		return
+	}
+	dur := job.ScheduleTime.Sub(time.Now())
+	if dur < 0 {
+		dur = 0
+	}
+	s.timer.Reset(dur)
 }
